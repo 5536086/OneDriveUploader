@@ -3,14 +3,14 @@ package http
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/buger/jsonparser"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
-
-	"github.com/buger/jsonparser"
+	"sync"
 )
 
 type Certificate struct {
@@ -30,6 +30,7 @@ var GraphURL = "https://graph.microsoft.com/v1.0/me/"
 var TokenURL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 var Host = "login.microsoftonline.com"
 var isCN = false
+var mutex sync.Mutex
 
 func ChangeCNURL() {
 	GraphURL = "https://microsoftgraph.chinacloudapi.cn/v1.0/me/"
@@ -73,11 +74,32 @@ func NewPassCheck(oauth2URL string, ms int, lang string) string {
 	return "./" + mail + ".json"
 }
 
+type UserData struct {
+	infoPath  string `json:"infoPath"`
+	Thread    int    `json:"Thread"`
+	BlockSize int    `json:"BlockSize"`
+	Language  string `json:"Language"`
+	TimeOut   int    `json:"TimeOut"`
+	BotKey    string `json:"BotKey"`
+	UserID    string `json:"UserID"`
+}
+
+var tempUserData UserData
+
 // GetMyIDAndBearer is get microsoft ID and access Certificate
 func GetMyIDAndBearer(infoPath string, Thread int, BlockSize int, Language string, TimeOut int, BotKey string, UserID string) (string, string) {
 	MyID := ""
 	Bearer := ""
 	_, err := os.Stat(infoPath)
+	tempUserData = UserData{
+		infoPath:  infoPath,
+		Thread:    Thread,
+		BlockSize: BlockSize,
+		Language:  Language,
+		TimeOut:   TimeOut,
+		BotKey:    BotKey,
+		UserID:    UserID,
+	}
 	Bearer = refreshAccessToken(infoPath, Thread, BlockSize, Language, TimeOut, BotKey, UserID)
 	url := GraphURL
 	req, err := http.NewRequest("GET", url, nil)
@@ -100,6 +122,10 @@ func GetMyIDAndBearer(infoPath string, Thread int, BlockSize int, Language strin
 	// log.Println(MyID)
 
 	return MyID, Bearer
+}
+
+func GetBearer() string {
+	return refreshAccessToken(tempUserData.infoPath, tempUserData.Thread, tempUserData.BlockSize, tempUserData.Language, tempUserData.TimeOut, tempUserData.BotKey, tempUserData.UserID)
 }
 
 func getAccessToken(oauth2URL string, ms int, lang string) string {
@@ -175,6 +201,7 @@ func getAccessToken(oauth2URL string, ms int, lang string) string {
 }
 
 func refreshAccessToken(path string, Thread int, BlockSize int, Language string, TimeOut int, BotKey string, UserID string) string {
+	mutex.Lock() //使用互斥锁防止线程数过高时信息被覆盖问题
 	filePtr, err := os.Open(path)
 	if err != nil {
 		log.Panicln(err)
@@ -235,6 +262,7 @@ func refreshAccessToken(path string, Thread int, BlockSize int, Language string,
 	// 创建Json编码器
 	encoder := json.NewEncoder(filePtr)
 	err = encoder.Encode(info)
+	defer mutex.Unlock()
 	if err != nil {
 		log.Panicln(err.Error())
 	}

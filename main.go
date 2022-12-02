@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,11 @@ func Upload(infoPath string, filePath string, targetFolder string, threads int, 
 	infoPath = filepath.Join(programPath, infoPath)
 
 	// restoreOption := "orig"
+	pathLastChar := filePath[len(filePath)-1]
+	if pathLastChar == '/' || pathLastChar == '\\' { // 当最后一位是/时，可能会出现找不到文件的情况，这里进行首先处理
+		filePath = filePath[:len(filePath)-1]
+	}
+
 	oldDir, err := os.Getwd()
 	if err != nil {
 		log.Panic(err)
@@ -85,10 +91,15 @@ func restore(restoreSrvc *upload.RestoreService, filesToRestore map[string]fileu
 	checkPath := make(map[string]bool, 0)
 	pathFiles := make(map[string]map[string]bool, 0)
 
-	for filePath, fileInfo := range filesToRestore {
+	filePaths := make([]string, 0, len(filesToRestore))
+	for k := range filesToRestore {
+		filePaths = append(filePaths, k)
+	}
+	sort.Sort(sort.StringSlice(filePaths)) //将文件按照文件名顺序排序
+	for _, filePath := range filePaths {
 		wg.Add(1)
 		pool <- struct{}{}
-
+		fileInfo := filesToRestore[filePath]
 		paths, fileName := filepath.Split(filepath.Join(targetFolder, filePath))
 		if mode == 1 {
 			if paths == "" {
@@ -137,7 +148,7 @@ func restore(restoreSrvc *upload.RestoreService, filesToRestore map[string]fileu
 				temp(tip)
 				time.Sleep(time.Second * 3)
 			}
-			defer temp("close")
+			defer temp("close=")
 		}(filePath, fileInfo)
 	}
 	wg.Wait()
@@ -188,10 +199,10 @@ func oldFunc(a string) string {
 }
 
 func botSend(botKey string, iuserID string, initText string) func(string) {
-	var message_id = int64(0)
+	var messageId = int64(0)
 	resp, err := http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage?chat_id=%s&parse_mode=MarkdownV2&text=%s", botKey, iuserID, url.QueryEscape(initText)))
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
@@ -201,35 +212,38 @@ func botSend(botKey string, iuserID string, initText string) func(string) {
 	//fmt.Println(string(body))
 	ok, _ := jsonparser.GetBoolean(body, "ok")
 	if ok {
-		message_id, _ = jsonparser.GetInt(body, "result", "message_id")
+		messageId, _ = jsonparser.GetInt(body, "result", "message_id")
 	} else {
 		description, _ := jsonparser.GetString(body, "description")
-		log.Panicf(loc.print("telegramSendError"), description)
+		log.Println(loc.print("telegramSendError"), description)
 	}
 	return func(text string) {
-		if text == "close" {
-			resp, err = http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%d", botKey, iuserID, message_id))
+		if text[:5] == "close" && text[5] != '|' {
+			// msg 头部的 close 用作输出时定位，带有 close 在输出时不会被刷新走
+			// close= 表示文件传输结束，此时会同步删除tg发出的消息
+			// close| 则不会删除消息
+			resp, err = http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%d", botKey, iuserID, messageId))
 			if err != nil {
-				log.Panic(err)
+				log.Println(err)
 			}
 			defer resp.Body.Close()
 			return
 		}
-		resp, err = http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText?chat_id=%s&parse_mode=MarkdownV2&message_id=%d&text=%s", botKey, iuserID, message_id, url.QueryEscape(text)))
+		resp, err = http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText?chat_id=%s&parse_mode=MarkdownV2&message_id=%d&text=%s", botKey, iuserID, messageId, url.QueryEscape(text)))
 		if err != nil {
-			log.Panic(err)
+			log.Println(err)
 		}
 		defer resp.Body.Close()
 		body, err = ioutil.ReadAll(resp.Body)
 		if err != nil {
-			log.Panic(err)
+			log.Println(err)
 		}
 		//fmt.Println(string(body))
 		ok, _ = jsonparser.GetBoolean(body, "ok")
 		if !ok {
 			description, _ := jsonparser.GetString(body, "description")
 			if !strings.Contains(string(body), "message is not modified") && !strings.Contains(string(body), "Too Many Requests") {
-				log.Panicf(loc.print("telegramSendError"), description)
+				log.Println(loc.print("telegramSendError"), description)
 			}
 		}
 
@@ -334,6 +348,14 @@ func main() {
 
 		_, _ = fmt.Fprintf(writer, loc.print("startToUpload"), folder, fileutil.Byte2Readable(float64(size)))
 
+		updateOutput := func(text string) {
+			if text[:5] != "close" {
+				_, _ = fmt.Fprintf(writer.Newline(), "%s\n", text)
+			} else {
+				_, _ = fmt.Fprintf(writer.Bypass(), "%s\n", text[6:])
+			}
+		}
+
 		var sendMsg func(string)
 		if botKey != "" && _UserID != "" {
 			sendMsg = botSend(botKey, _UserID, fmt.Sprintf(loc.print("startToUpload"), folder, fileutil.Byte2Readable(float64(size))))
@@ -342,17 +364,9 @@ func main() {
 		case "OneDrive":
 			Upload(strings.ReplaceAll(configFile, "\\", "/"), strings.ReplaceAll(folder, "\\", "/"), targetFolder, thread, func() (func(text string), string, string) {
 				if botKey != "" && _UserID != "" {
-					return func(text string) {
-						if text != "close" {
-							_, _ = fmt.Fprintf(writer, "%s\n", text)
-						}
-					}, botKey, _UserID
+					return updateOutput, botKey, _UserID
 				} else {
-					return func(text string) {
-						if text != "close" {
-							_, _ = fmt.Fprintf(writer, "%s\n", text)
-						}
-					}, "", ""
+					return updateOutput, "", ""
 				}
 			}, func(text string) string {
 				return loc.print(text)
@@ -360,17 +374,9 @@ func main() {
 		case "GoogleDrive":
 			googledrive.Upload(strings.ReplaceAll(configFile, "\\", "/"), strings.ReplaceAll(folder, "\\", "/"), func() (func(text string), string, string, func(string, string, string) func(string)) {
 				if botKey != "" && _UserID != "" {
-					return func(text string) {
-						if text != "close" {
-							_, _ = fmt.Fprintf(writer, "%s\n", text)
-						}
-					}, botKey, _UserID, botSend
+					return updateOutput, botKey, _UserID, botSend
 				} else {
-					return func(text string) {
-						if text != "close" {
-							_, _ = fmt.Fprintf(writer, "%s\n", text)
-						}
-					}, "", "", nil
+					return updateOutput, "", "", nil
 				}
 			}, func(text string) string {
 				return loc.print(text)
@@ -380,8 +386,9 @@ func main() {
 
 		cost := time.Now().Unix() - startTime
 		speed := fileutil.Byte2Readable(float64(size) / float64(cost))
-		_, _ = fmt.Fprintf(writer, loc.print("completeUpload"), folder, cost, speed)
+		_, _ = fmt.Fprintf(writer.Bypass(), loc.print("completeUpload"), folder, cost, speed)
 		if botKey != "" && _UserID != "" {
+			log.Printf(fmt.Sprintf(loc.print("completeUpload"), folder, cost, speed))
 			sendMsg(fmt.Sprintf(loc.print("completeUpload"), folder, cost, speed))
 		}
 	} else {
@@ -412,9 +419,9 @@ func main() {
 
 /*
 SET CGO_ENABLED=0
-SET GOOS=linux
+$env:GOOS="linux"
 SET GOARCH=amd64
-go build -o OneDriveUploader .
+go build -o LightUploader .
 /usr/local/bin
 
 set HTTPS_PROXY=http://127.0.0.1:2334
